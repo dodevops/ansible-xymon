@@ -1,10 +1,15 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+import os
+import socket
+from time import ctime
 
+# noinspection PyUnresolvedReferences
+from ansible.module_utils.basic import AnsibleModule
 
 DOCUMENTATION = '''
 ---
 module: xymon
-version_added: "1.0"
+version_added: "1.1"
 author: "Bert Raeymaekers (https://github.com/BertRaeymaekers)"
 short_description: Controls states of hosts and test in Xymon
 description:
@@ -27,10 +32,10 @@ options:
     required: true
     description:
     - "The desired state."
-  test:
+  tests:
     required: false
     description:
-    - "The test as specified in Xymon."
+    - "The comma seperated list of tests as specified in Xymon."
     - "It is required for setting a color as state (green, yellow, red) and
        absent."
     - "Note that for absent by default, dropping a test in Xymon can only be
@@ -38,7 +43,7 @@ options:
        like delegate_to: xymonhost."
     - "If not specified (allowed with state disabled or enabled) it will effect
        all the tests on the host."
-    default:
+    default: '*'
   interval:
     required: false
     description:
@@ -51,7 +56,7 @@ options:
     - "Note: for disable Xs doesn't seem to work."
     - "There is one special value: -1 for when setting state disabled, which
       indicates disable until the first green monitoring event cames along."
-    default:
+    default: '30m'
   msg:
     required: false
     description:
@@ -71,7 +76,15 @@ EXAMPLES = '''
 - xymon:
     xymon_host: 192.168.0.24
     host: www.example.com
-    test: httpstatus
+    tests: httpstatus
+    state: disabled
+    interval: 5
+
+# Disable monitoring for 5 minutes on tests httpstatus and cpu on www.example.com:
+- xymon:
+    xymon_host: 192.168.0.24
+    host: www.example.com
+    tests: httpstatus,cpu
     state: disabled
     interval: 5
 
@@ -98,12 +111,6 @@ RETURN_VALUES = '''
 '''
 
 
-import socket
-from time import ctime
-
-from ansible.module_utils.basic import AnsibleModule
-
-
 class Xymon(object):
     """Communicate with a Xymon server
 
@@ -111,19 +118,19 @@ class Xymon(object):
             if set, or 'localhost' if not.
     port:   The port number the server listens on. Defaults to 1984.
     """
+
     def __init__(self, server=None, port=None):
-        if server is None:
-            server = os.environ.get('XYMSRV', 'localhost')
-        if port is None:
-            port=1984
+        self.server = server if server else os.environ.get('XYMSRV', 'localhost')
+        self.port = port if port else 1984
         self.server = server
         self.port = port
 
-    def report(self, host, test, color, message=None, interval=None):
+    def report(self, host, tests, test, color, message=None, interval=None):
         """Report status to a Xymon server
 
         host:     The hostname to associate the report with.
-        test:     The name of the test or service.
+        test:     The name of a single test or service.
+        tests:    A comma separated list of tests or services.
         color:    The color to set. Can be 'green', 'yellow', 'red', or 'clear'
         message:  Details about the current state.
         interval: An optional interval between tests. The status will change
@@ -136,13 +143,13 @@ class Xymon(object):
         args = {
             'host': host,
             'test': test,
+            'tests': tests,
             'color': color,
             'message': message,
             'interval': interval,
             'date': ctime(),
         }
-        report = '''status+{interval} {host}.{test} {color} {date}
-{message}'''.format(**args)
+        report = '''status+{interval} {host}.{test} {color} {date} {message}'''.format(**args)
         self.send_message(report)
 
     def status(self, host, test):
@@ -158,34 +165,36 @@ class Xymon(object):
         report = '''query {host}.{test}'''.format(**args)
         result = self.send_message(report, report=True)
         if result:
-            return (result.split()[0], result.split()[1:])
+            return result.split()[0], result.split()[1:]
         else:
-            return (None, None)
+            return None, None
 
-    def enable(self, host, test=None):
-        if not test:
-            test = "*"
-        args = {
-            'host': host,
-            'test': test
-        }
-        report = 'enable {host}.{test}'.format(**args)
-        self.send_message(report)
+    def enable(self, host, tests=None):
+        if not tests:
+            tests = "*"
+        for test in tests.split(","):
+            args = {
+                'host': host,
+                'test': test
+            }
+            report = 'enable {host}.{test}'.format(**args)
+            self.send_message(report)
 
-    def disable(self, host, interval, test=None, message=None):
-        if not test:
-            test = "*"
+    def disable(self, host, interval, tests=None, message=None):
+        if not tests:
+            tests = "*"
         if not message:
-            message = 'Set disabled for %s by Ansible module xymon' % (interval)
-        args = {
-            'host': host,
-            'test': test,
-            'interval': interval,
-            'message': message,
-            'date': ctime(),
-        }
-        report = 'disable {host}.{test} {interval} {date} {message}'.format(**args)
-        self.send_message(report)
+            message = 'Set disabled for %s by Ansible module xymon' % interval
+        for test in tests.split(","):
+            args = {
+                'host': host,
+                'test': test,
+                'interval': interval,
+                'message': message,
+                'date': ctime(),
+            }
+            report = 'disable {host}.{test} {interval} {date} {message}'.format(**args)
+            self.send_message(report)
 
     def drop(self, host, test=None):
         if test:
@@ -218,8 +227,8 @@ class Xymon(object):
             }
             report = 'rename {host} {oldtest} {newtest}'.format(**args)
         else:
-            raise KeyError("You must eigher pass a newhost or both test and newtest")
-        self.sed_message(report)
+            raise KeyError("You must either pass a newhost or both test and newtest")
+        self.send_message(report)
 
     def data(self, host, test, raw_data):
         """Report data to a Xymon server
@@ -244,7 +253,7 @@ class Xymon(object):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             server_ip = socket.gethostbyname(self.server)
-            message = message + '\n'
+            message += '\n'
             s.connect((server_ip, self.port))
             s.sendall(message.encode())
         except:
@@ -255,16 +264,16 @@ class Xymon(object):
 
 
 def run_module():
-
     module = AnsibleModule(
-        argument_spec = dict(
-           xymon_host=dict(required=True, type='str'),
-           xymon_port=dict(required=False, type='int'),
-           host=dict(required=True, type='str'),
-           state=dict(required=True, choices=list(STATE_FIELDS)),
-           test=dict(required=False, type='str'),
-           interval=dict(required=False, type='str'),
-           msg=dict(required=False, type='str')
+        argument_spec=dict(
+            xymon_host=dict(required=True, type='str'),
+            xymon_port=dict(required=False, type='int'),
+            host=dict(required=True, type='str'),
+            state=dict(required=True, choices=list(STATE_FIELDS)),
+            test=dict(required=False, type='str'),
+            tests=dict(required=False, type='str'),
+            interval=dict(required=False, type='str'),
+            msg=dict(required=False, type='str')
         ),
         supports_check_mode=False)
 
@@ -274,6 +283,7 @@ def run_module():
         try:
             xymon.report(
                 host=module.params['host'],
+                tests=module.params['tests'],
                 test=module.params['test'],
                 color=module.params['state'],
                 message=module.params['msg'],
@@ -281,9 +291,10 @@ def run_module():
             )
             module.exit_json(changed=True)
         except KeyError:
-            module.fail_json(msg="Parameters host, test, msg and interval are required when specifying green, yellow or red.")
+            module.fail_json(
+                msg="Parameters host, test, msg and interval are required when specifying green, yellow or red.")
         except socket.error as e:
-            module.fail_json(msg="Socket error: %s" % (e))
+            module.fail_json(msg="Socket error: %s" % e)
         except Exception as e:
             import traceback
             module.fail_json(msg="%s error: %s" % (type(e), e), traceback=traceback.format_exc())
@@ -291,13 +302,13 @@ def run_module():
         try:
             xymon.enable(
                 host=module.params['host'],
-                test=module.params['test']
+                tests=module.params['tests']
             )
             module.exit_json(changed=True)
         except KeyError:
-            module.fail_json(msg="Parameters host and test are required when specifying state enabled.")
+            module.fail_json(msg="Parameters 'host' and 'tests' are required when specifying state enabled.")
         except socket.error as e:
-            module.fail_json(msg="Socket error: %s" % (e))
+            module.fail_json(msg="Socket error: %s" % e)
         except Exception as e:
             import traceback
             module.fail_json(msg="%s error: %s" % (type(e), e), traceback=traceback.format_exc())
@@ -305,15 +316,19 @@ def run_module():
         try:
             xymon.disable(
                 host=module.params['host'],
-                test=module.params.get('test', None),
+                tests=module.params.get('tests', None),
                 interval=module.params['interval'],
                 message=module.params.get('msg', None)
             )
             module.exit_json(changed=True)
         except KeyError:
-            module.fail_json(msg="Parameters host and interval are required when specifying state disabled.")
+            import traceback
+            module.fail_json(
+                msg="Parameters host and interval are required when specifying state disabled. -> " + module.params.get(
+                    'host') + ", " + module.params.get('interval') + ", " + module.params.get('tess'),
+                traceback=traceback.format_exc())
         except socket.error as e:
-            module.fail_json(msg="Socket error: %s" % (e))
+            module.fail_json(msg="Socket error: %s" % e)
         except Exception as e:
             import traceback
             module.fail_json(msg="%s error: %s" % (type(e), e), traceback=traceback.format_exc())
@@ -326,7 +341,7 @@ def run_module():
         except KeyError:
             module.fail_json(msg="Parameters host and interval are required when specifying state disabled.")
         except socket.error as e:
-            module.fail_json(msg="Socket error: %s" % (e))
+            module.fail_json(msg="Socket error: %s" % e)
         except Exception as e:
             import traceback
             module.fail_json(msg="%s error: %s" % (type(e), e), traceback=traceback.format_exc())
@@ -337,17 +352,20 @@ def run_module():
                 host=module.params['host'],
                 test=module.params['test'],
                 newhost=module.params['newhost'],
-                newest=module.params['newtest']
+                newtest=module.params['newtest']
             )
         except KeyError:
-            module.fail_json(msg='Or parameter newhost, or parameter test and newtest must be specified but cannot be mixed when specifying state rename.')
+            module.fail_json(
+                msg='Or parameter newhost, or parameter test and newtest must be specified but cannot be mixed when ' +
+                    'specifying state rename.')
         except socket.error as e:
-            module.fail_json(msg="Socket error: %s" % (e))
+            module.fail_json(msg="Socket error: %s" % e)
         except Exception as e:
             import traceback
             module.fail_json(msg="%s error: %s" % (type(e), e), traceback=traceback.format_exc())
         module.exit_json(changed=False)
     elif module.params['state'] == 'query':
+        status = msg = None
         try:
             (status, msg) = xymon.status(
                 host=module.params['host'],
@@ -356,14 +374,16 @@ def run_module():
         except KeyError:
             module.fail_json(msg='Parameters host and test are required when querying the state.')
         except socket.error as e:
-            module.fail_json(msg="Socket error: %s" % (e))
+            module.fail_json(msg="Socket error: %s" % e)
         except Exception as e:
             import traceback
             module.fail_json(msg="%s error: %s" % (type(e), e), traceback=traceback.format_exc())
         module.exit_json(changed=False, status=status, msg=msg)
 
+
 def main():
     run_module()
+
 
 if __name__ == "__main__":
     main()
